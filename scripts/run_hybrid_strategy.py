@@ -11,6 +11,10 @@ from datetime import datetime, timedelta
 import pandas as pd
 import traceback
 
+# 强制matplotlib使用Agg后端，确保在无GUI环境中也能正确保存图片
+import matplotlib
+matplotlib.use('Agg')
+
 # 添加项目根目录到Python路径
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -28,6 +32,59 @@ from crypto_quant.utils.output_helper import (
 )
 # 导入新的风险管理模块
 from crypto_quant.risk_management.risk_manager import RiskManager
+# 导入新的图像调试模块
+from crypto_quant.utils.image_debug import image_logger, trace_image_save, debug_figure, setup_image_debug_logger
+
+# 添加一个自定义函数来获取与报告相同目录的图片路径
+def get_image_in_report_dir(filename, subdirectory=None):
+    """
+    获取与报告相同目录的图片路径
+    
+    Args:
+        filename (str): 文件名
+        subdirectory (str, optional): 子目录名
+        
+    Returns:
+        str: 完整的文件路径
+    """
+    try:
+        from crypto_quant.utils.output_helper import DEFAULT_REPORTS_DIR, ensure_dir_exists
+        
+        if subdirectory is None:
+            subdirectory = datetime.now().strftime('%Y-%m-%d')
+        
+        # 确保有.png扩展名
+        if not filename.endswith('.png'):
+            filename = f"{filename}.png"
+        
+        # 获取绝对路径
+        report_dir = os.path.abspath(os.path.join(DEFAULT_REPORTS_DIR, subdirectory))
+        logger.info(f"报告目录绝对路径: {report_dir}")
+        
+        # 确保目录存在
+        if not os.path.exists(report_dir):
+            logger.info(f"创建报告目录: {report_dir}")
+            os.makedirs(report_dir, exist_ok=True)
+        
+        full_path = os.path.join(report_dir, filename)
+        logger.info(f"完整的图片绝对路径: {full_path}")
+        
+        # 检查目录是否可写
+        if not os.access(report_dir, os.W_OK):
+            logger.error(f"目录不可写: {report_dir}")
+            # 尝试修改权限
+            try:
+                logger.info(f"尝试修改目录权限: {report_dir}")
+                os.chmod(report_dir, 0o755)
+            except Exception as perm_error:
+                logger.error(f"无法修改目录权限: {str(perm_error)}")
+        
+        return full_path
+    except Exception as e:
+        logger.error(f"获取图片路径时出错: {str(e)}")
+        logger.error(traceback.format_exc())
+        # 返回一个默认路径
+        return os.path.join(os.getcwd(), filename)
 
 def parse_args():
     """解析命令行参数"""
@@ -68,6 +125,8 @@ def parse_args():
     parser.add_argument("--use-atr-stops", action="store_true", help="是否使用ATR动态止损")
     parser.add_argument("--max-trades-day", type=int, default=3, help="每日最大交易次数")
     parser.add_argument("--time-stop-bars", type=int, default=10, help="时间止损K线数")
+    parser.add_argument("--volatility-lookback", type=int, default=20, help="波动率计算回看周期")
+    parser.add_argument("--min-lookback", type=int, default=5, help="最小回看周期，用于渐进式风险管理")
     
     # 输出参数
     parser.add_argument("--output-dir", type=str, help="输出目录名称")
@@ -77,12 +136,64 @@ def parse_args():
     parser.add_argument("--clean-days", type=int, default=0, 
                         help="清理多少天前的输出文件，0表示不清理")
     
+    # 图片保存测试
+    parser.add_argument("--test-image-save", action="store_true", help="测试图片保存功能")
+    
     return parser.parse_args()
 
 def run_hybrid_strategy(args):
     """运行混合策略回测"""
     # 设置日志级别
     set_log_level(args.log_level)
+    
+    # 测试matplotlib图片保存功能
+    if args.test_image_save:
+        try:
+            import matplotlib.pyplot as plt
+            import numpy as np
+            
+            logger.info("开始测试matplotlib图片保存功能...")
+            
+            # 创建一个简单的测试图
+            x = np.linspace(0, 10, 100)
+            y = np.sin(x)
+            
+            plt.figure(figsize=(5, 5))
+            plt.plot(x, y)
+            plt.title("测试图片")
+            
+            # 保存到当前目录
+            test_path = os.path.join(os.getcwd(), "test_matplotlib.png")
+            logger.info(f"尝试保存图片到当前目录: {test_path}")
+            plt.savefig(test_path)
+            
+            if os.path.exists(test_path):
+                logger.info(f"图片保存成功！文件大小: {os.path.getsize(test_path)} 字节")
+            else:
+                logger.error("图片保存失败，文件不存在")
+            
+            # 保存到报告目录
+            if args.output_dir:
+                report_dir = os.path.join(parent_dir, 'output', 'reports', args.output_dir)
+                if not os.path.exists(report_dir):
+                    os.makedirs(report_dir, exist_ok=True)
+                
+                report_path = os.path.join(report_dir, "test_report.png")
+                logger.info(f"尝试保存图片到报告目录: {report_path}")
+                plt.savefig(report_path)
+                
+                if os.path.exists(report_path):
+                    logger.info(f"保存到报告目录成功！文件大小: {os.path.getsize(report_path)} 字节")
+                else:
+                    logger.error("保存到报告目录失败，文件不存在")
+            
+            plt.close()
+            logger.info("matplotlib图片保存测试完成")
+            return True
+        except Exception as e:
+            logger.error(f"测试matplotlib图片保存功能时出错: {str(e)}")
+            logger.error(traceback.format_exc())
+            return False
     
     # 设置输出目录
     if args.output_dir:
@@ -144,11 +255,14 @@ def run_hybrid_strategy(args):
             take_profit=args.take_profit,
             max_trades_per_day=args.max_trades_day if args.max_trades_day > 0 else None,
             time_stop_bars=args.time_stop_bars if args.time_stop_bars > 0 else None,
+            volatility_lookback=args.volatility_lookback,
+            min_lookback=args.min_lookback,
             volatility_scale_factor=3.0 if args.volatility_scale else 0.0,
             use_atr_for_stops=args.use_atr_stops,
             initial_capital=args.initial_capital
         )
-        logger.info(f"风险管理器初始化完成，最大回撤限制: {args.max_drawdown:.2%}, 最大头寸比例: {args.max_position_size:.2%}")
+        logger.info(f"风险管理器初始化完成，最大回撤限制: {args.max_drawdown:.2%}, 最大头寸比例: {args.max_position_size:.2%}, "
+                   f"使用渐进式风险管理，最小回看周期: {args.min_lookback}")
     
     # 创建并测试不同的混合策略组合方法
     backtest_results = {}
@@ -272,79 +386,111 @@ def run_hybrid_strategy(args):
                 
                 # 首先检查必要的列是否存在
                 if 'equity_curve' not in backtest_results[method].columns:
+                    image_logger.error(f"{method}方法的回测结果中缺少equity_curve列，跳过图表生成")
                     logger.warning(f"{method}方法的回测结果中缺少equity_curve列，跳过图表生成")
                     continue
+                
+                image_logger.info(f"开始为 {method} 方法创建资本曲线图...")
                 
                 plt.figure(figsize=(12, 8))
                 
                 # 绘制资本曲线
                 equity_curve = backtest_results[method]['equity_curve']
-                plt.plot(equity_curve.index, equity_curve, label=f"{method}")
+                # 标准化曲线 - 计算收益率而非绝对值
+                normalized_curve = (equity_curve / equity_curve.iloc[0] - 1) * 100
+                plt.plot(equity_curve.index, normalized_curve, label=f"{method} 收益率")
                 
-                # 如果使用了风险管理，绘制回撤曲线和头寸大小
-                if args.risk_management and 'drawdown' in backtest_results[method].columns:
-                    # 创建第二个Y轴
-                    ax2 = plt.gca().twinx()
-                    
-                    # 绘制回撤(反转数值以在下方显示)
-                    drawdown_curve = -backtest_results[method]['drawdown']
-                    ax2.fill_between(drawdown_curve.index, 0, drawdown_curve, 
-                                    alpha=0.3, color='red', label='回撤')
-                    
-                    # 如果有头寸大小数据，添加到图中
-                    if 'position_size' in backtest_results[method].columns:
-                        # 创建第三个Y轴
-                        ax3 = plt.gca().twinx()
-                        ax3.spines['right'].set_position(('outward', 60))
-                        
-                        # 绘制头寸大小
-                        position_sizes = backtest_results[method]['position_size']
-                        ax3.plot(position_sizes.index, position_sizes, 
-                                '--', color='green', alpha=0.6, label='头寸比例')
-                        ax3.set_ylim(0, args.max_position_size * 1.1)
-                        ax3.set_ylabel('头寸比例')
-                        
-                        # 添加第三个Y轴的图例到主图例
-                        lines3, labels3 = ax3.get_legend_handles_labels()
-                    
-                    # 设置第二个Y轴的属性
-                    ax2.set_ylabel('回撤')
-                    ax2.set_ylim(-args.max_drawdown * 1.5, 0.05)
-                    
-                    # 添加第二个Y轴的图例到主图例
-                    lines2, labels2 = ax2.get_legend_handles_labels()
-                
-                # 添加基准（买入持有）
+                # 添加基准（买入持有）- 也标准化为收益率
                 benchmark = df['close'] / df['close'].iloc[0] * args.initial_capital
-                plt.plot(benchmark.index, benchmark, label='Buy & Hold', linestyle='--', color='gray')
+                normalized_benchmark = (benchmark / benchmark.iloc[0] - 1) * 100
+                plt.plot(benchmark.index, normalized_benchmark, label='Buy & Hold 收益率', linestyle='--', color='gray')
                 
                 # 设置图表属性
-                plt.title(f'{method}策略资本曲线' + (' (含高级风险管理)' if args.risk_management else ''))
+                plt.title(f'{method}策略收益率曲线' + (' (含高级风险管理)' if args.risk_management else ''))
                 plt.xlabel('日期')
-                plt.ylabel('资本($)')
+                plt.ylabel('收益率(%)')
                 
                 # 合并图例
                 lines1, labels1 = plt.gca().get_legend_handles_labels()
-                if args.risk_management and 'drawdown' in backtest_results[method].columns:
-                    if 'position_size' in backtest_results[method].columns:
-                        plt.legend(lines1 + lines2 + lines3, labels1 + labels2 + labels3, loc='best')
-                    else:
-                        plt.legend(lines1 + lines2, labels1 + labels2, loc='best')
-                else:
-                    plt.legend(loc='best')
                 
-                plt.grid(True)
+                # 记录图表信息到调试日志
+                debug_figure(plt.gcf(), f"{method}策略收益率曲线")
                 
                 # 应用中文字体
-                font_helper.apply_font_to_figure(plt.gcf())
+                font_helper.apply_font_to_figure()
                 
-                # 保存图表
-                method_chart_path = get_image_path(f"{method}_equity_curve.png", subdirectory=output_subdir)
-                plt.savefig(method_chart_path)
+                # 添加调试日志
+                image_logger.info(f"准备保存 {method} 方法的收益率曲线图...")
+                
+                # 保存图表 - 使用新的图像调试工具
+                try:
+                    # 直接使用绝对路径构建目标文件路径
+                    report_dir = os.path.abspath(os.path.join(parent_dir, 'output', 'reports', output_subdir))
+                    image_logger.info(f"报告目录绝对路径: {report_dir}")
+                    
+                    # 确保目录存在
+                    if not os.path.exists(report_dir):
+                        os.makedirs(report_dir, exist_ok=True)
+                        image_logger.info(f"创建了报告目录: {report_dir}")
+                    
+                    # 报告目录权限检查
+                    if not os.access(report_dir, os.W_OK):
+                        image_logger.error(f"报告目录不可写: {report_dir}")
+                        try:
+                            # 尝试修改权限
+                            os.chmod(report_dir, 0o755)
+                            image_logger.info(f"已修改报告目录权限: {report_dir}")
+                        except Exception as perm_e:
+                            image_logger.error(f"修改权限失败: {str(perm_e)}")
+                    
+                    # 生成目标文件路径
+                    image_filename = f"{method}_equity_curve.png"
+                    method_chart_path = os.path.join(report_dir, image_filename)
+                    
+                    # 使用高级跟踪函数保存图像
+                    success = trace_image_save(plt.gcf(), method_chart_path, dpi=100)
+                    
+                    if success:
+                        image_logger.info(f"{method}方法的收益率曲线图已成功保存至: {method_chart_path}")
+                        # 还尝试保存到images目录以供后续查看
+                        try:
+                            images_dir = os.path.abspath(os.path.join(parent_dir, 'output', 'images', datetime.now().strftime('%Y-%m-%d')))
+                            if not os.path.exists(images_dir):
+                                os.makedirs(images_dir, exist_ok=True)
+                            
+                            image_backup_path = os.path.join(images_dir, image_filename)
+                            trace_image_save(plt.gcf(), image_backup_path, dpi=100)
+                            image_logger.info(f"已创建备份图像: {image_backup_path}")
+                        except Exception as backup_e:
+                            image_logger.warning(f"创建备份图像失败: {str(backup_e)}")
+                    else:
+                        # 尝试保存到临时目录
+                        image_logger.warning("无法保存到报告目录，尝试保存到临时目录...")
+                        temp_dir = '/tmp'
+                        temp_path = os.path.join(temp_dir, image_filename)
+                        
+                        if trace_image_save(plt.gcf(), temp_path):
+                            image_logger.info(f"成功保存到临时目录: {temp_path}")
+                            # 尝试复制到目标位置
+                            import shutil
+                            try:
+                                shutil.copy(temp_path, method_chart_path)
+                                image_logger.info(f"已从临时目录复制到目标位置: {method_chart_path}")
+                            except Exception as cp_err:
+                                image_logger.error(f"从临时目录复制失败: {str(cp_err)}")
+                        else:
+                            image_logger.error("临时目录保存也失败")
+                except Exception as e:
+                    image_logger.error(f"保存图表时出错: {str(e)}")
+                    image_logger.error(traceback.format_exc())
+                    logger.error(f"保存{method}方法的收益率曲线图时出错: {str(e)}")
+                
                 plt.close()
-                logger.info(f"{method}方法的资本曲线图已保存至: {method_chart_path}")
+                logger.info(f"{method}方法的收益率曲线图已保存或尝试保存")
             except Exception as e:
-                logger.error(f"生成{method}方法的资本曲线图时出错: {str(e)}")
+                image_logger.error(f"生成{method}方法的收益率曲线图时出错: {str(e)}")
+                image_logger.error(traceback.format_exc())
+                logger.error(f"生成{method}方法的收益率曲线图时出错: {str(e)}")
                 logger.error(traceback.format_exc())
         
         except Exception as e:
@@ -418,40 +564,120 @@ def run_hybrid_strategy(args):
             
             plt.figure(figsize=(12, 8))
             
+            image_logger.info("开始创建混合策略组合方法收益率比较图...")
+            
             valid_methods = []
             for method in successful_methods:
                 if 'equity_curve' not in backtest_results[method].columns:
+                    image_logger.warning(f"{method}方法的回测结果中缺少equity_curve列，将在比较图中跳过该方法")
                     logger.warning(f"{method}方法的回测结果中缺少equity_curve列，将在比较图中跳过该方法")
                     continue
+                
+                # 标准化为收益率百分比
                 equity_curve = backtest_results[method]['equity_curve']
-                plt.plot(equity_curve.index, equity_curve, label=f"{method}")
+                normalized_curve = (equity_curve / equity_curve.iloc[0] - 1) * 100
+                plt.plot(equity_curve.index, normalized_curve, label=f"{method}")
+                image_logger.debug(f"添加{method}方法到对比图: 收益率范围[{normalized_curve.min():.2f}%-{normalized_curve.max():.2f}%]")
                 valid_methods.append(method)
             
             # 只有在至少有一个有效方法时才继续绘图
             if valid_methods:
-                # 添加基准（买入持有）
-                benchmark = df['close'] / df['close'].iloc[0] * args.initial_capital
-                plt.plot(benchmark.index, benchmark, label='Buy & Hold', linestyle='--', color='gray')
+                image_logger.info(f"有效的策略方法: {', '.join(valid_methods)}")
                 
-                plt.title('混合策略组合方法资本曲线比较' + (' (含高级风险管理)' if args.risk_management else ''))
+                # 添加基准（买入持有）- 也标准化为收益率
+                benchmark = df['close'] / df['close'].iloc[0] * args.initial_capital
+                normalized_benchmark = (benchmark / benchmark.iloc[0] - 1) * 100
+                plt.plot(benchmark.index, normalized_benchmark, label='Buy & Hold', linestyle='--', color='gray')
+                image_logger.debug(f"添加基准数据: 收益率范围[{normalized_benchmark.min():.2f}%-{normalized_benchmark.max():.2f}%]")
+                
+                plt.title('混合策略组合方法收益率比较' + (' (含高级风险管理)' if args.risk_management else ''))
                 plt.xlabel('日期')
-                plt.ylabel('资本($)')
+                plt.ylabel('收益率(%)')
                 plt.legend()
                 plt.grid(True)
                 
-                # 应用中文字体
-                font_helper.apply_font_to_figure(plt.gcf())
+                # 记录图表信息到调试日志
+                debug_figure(plt.gcf(), "混合策略组合方法收益率比较")
                 
-                # 保存图表
-                equity_curve_path = get_image_path("hybrid_strategy_comparison.png", subdirectory=output_subdir)
-                plt.savefig(equity_curve_path)
+                # 应用中文字体
+                font_helper.apply_font_to_figure()
+                
+                # 添加调试日志
+                image_logger.info(f"准备保存混合策略收益率对比图...")
+                
+                # 保存图表 - 使用图像调试工具
+                try:
+                    # 直接使用绝对路径构建目标文件路径
+                    report_dir = os.path.abspath(os.path.join(parent_dir, 'output', 'reports', output_subdir))
+                    image_logger.info(f"报告目录绝对路径: {report_dir}")
+                    
+                    # 确保目录存在
+                    if not os.path.exists(report_dir):
+                        os.makedirs(report_dir, exist_ok=True)
+                        image_logger.info(f"创建了报告目录: {report_dir}")
+                    
+                    # 报告目录权限检查
+                    if not os.access(report_dir, os.W_OK):
+                        image_logger.error(f"报告目录不可写: {report_dir}")
+                        try:
+                            # 尝试修改权限
+                            os.chmod(report_dir, 0o755)
+                            image_logger.info(f"已修改报告目录权限: {report_dir}")
+                        except Exception as perm_e:
+                            image_logger.error(f"修改权限失败: {str(perm_e)}")
+                            
+                    # 生成目标文件路径
+                    image_filename = "hybrid_strategy_comparison.png"
+                    equity_curve_path = os.path.join(report_dir, image_filename)
+                    
+                    # 使用高级跟踪函数保存图像
+                    success = trace_image_save(plt.gcf(), equity_curve_path, dpi=100)
+                    
+                    if success:
+                        image_logger.info(f"混合策略收益率对比图已成功保存至: {equity_curve_path}")
+                        # 还尝试保存到images目录以供后续查看
+                        try:
+                            images_dir = os.path.abspath(os.path.join(parent_dir, 'output', 'images', datetime.now().strftime('%Y-%m-%d')))
+                            if not os.path.exists(images_dir):
+                                os.makedirs(images_dir, exist_ok=True)
+                            
+                            image_backup_path = os.path.join(images_dir, image_filename)
+                            trace_image_save(plt.gcf(), image_backup_path, dpi=100)
+                            image_logger.info(f"已创建备份对比图像: {image_backup_path}")
+                        except Exception as backup_e:
+                            image_logger.warning(f"创建备份对比图像失败: {str(backup_e)}")
+                    else:
+                        # 尝试保存到临时目录
+                        image_logger.warning("无法保存到报告目录，尝试保存到临时目录...")
+                        temp_dir = '/tmp'
+                        temp_path = os.path.join(temp_dir, image_filename)
+                        
+                        if trace_image_save(plt.gcf(), temp_path):
+                            image_logger.info(f"成功保存到临时目录: {temp_path}")
+                            # 尝试复制到目标位置
+                            import shutil
+                            try:
+                                shutil.copy(temp_path, equity_curve_path)
+                                image_logger.info(f"已从临时目录复制到目标位置: {equity_curve_path}")
+                            except Exception as cp_err:
+                                image_logger.error(f"从临时目录复制失败: {str(cp_err)}")
+                        else:
+                            image_logger.error("临时目录保存也失败")
+                except Exception as e:
+                    image_logger.error(f"保存对比图时出错: {str(e)}")
+                    image_logger.error(traceback.format_exc())
+                    logger.error(f"保存混合策略收益率对比图时出错: {str(e)}")
+                
                 plt.close()
-                logger.info(f"混合策略资本曲线对比图已保存至: {equity_curve_path}")
+                logger.info(f"混合策略收益率对比图已保存或尝试保存")
             else:
-                logger.warning("没有有效的策略资本曲线数据，无法生成比较图")
+                image_logger.warning("没有有效的策略收益率数据，无法生成比较图")
+                logger.warning("没有有效的策略收益率数据，无法生成比较图")
                 plt.close()  # 关闭空图
         except Exception as e:
-            logger.error(f"生成资本曲线对比图时出错: {str(e)}")
+            image_logger.error(f"生成收益率对比图时出错: {str(e)}")
+            image_logger.error(traceback.format_exc())
+            logger.error(f"生成收益率对比图时出错: {str(e)}")
             logger.error(traceback.format_exc())
         
         # 分析最佳组合方法
@@ -542,7 +768,9 @@ def run_hybrid_strategy(args):
                 'volatility_scale': args.volatility_scale,
                 'use_atr_stops': args.use_atr_stops,
                 'max_trades_day': args.max_trades_day,
-                'time_stop_bars': args.time_stop_bars
+                'time_stop_bars': args.time_stop_bars,
+                'volatility_lookback': args.volatility_lookback,
+                'min_lookback': args.min_lookback
             }
             strategy_params.update(risk_params)
         
@@ -661,13 +889,56 @@ def run_hybrid_strategy(args):
 
 ## 附图
 
-- [资本曲线对比图](../images/{output_subdir}/hybrid_strategy_comparison.png)
-- [最佳方法资本曲线](../images/{output_subdir}/{best_method_name}_equity_curve.png)
+- [收益率对比图](hybrid_strategy_comparison.png)
+- [最佳方法收益率曲线]({best_method_name}_equity_curve.png)
 
 ---
 
 *报告生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*
 """
+
+            # 验证图片文件是否存在
+            report_dir = os.path.abspath(os.path.join(parent_dir, 'output', 'reports', output_subdir))
+            image_logger.info(f"验证报告引用的图片文件是否存在，报告目录: {report_dir}")
+            
+            hybrid_comparison_path = os.path.join(report_dir, "hybrid_strategy_comparison.png")
+            best_method_path = os.path.join(report_dir, f"{best_method_name}_equity_curve.png")
+            
+            image_logger.info(f"对比图路径: {hybrid_comparison_path}, 是否存在: {os.path.exists(hybrid_comparison_path)}")
+            image_logger.info(f"最佳方法图路径: {best_method_path}, 是否存在: {os.path.exists(best_method_path)}")
+            
+            # 检查图片是否存在，如果不存在则添加警告
+            if not os.path.exists(hybrid_comparison_path):
+                image_logger.warning(f"对比图文件不存在: {hybrid_comparison_path}")
+            if not os.path.exists(best_method_path):
+                image_logger.warning(f"最佳方法图文件不存在: {best_method_path}")
+                
+            # 检查备份目录中是否有这些图片
+            images_dir = os.path.abspath(os.path.join(parent_dir, 'output', 'images', datetime.now().strftime('%Y-%m-%d')))
+            backup_comparison_path = os.path.join(images_dir, "hybrid_strategy_comparison.png")
+            backup_best_method_path = os.path.join(images_dir, f"{best_method_name}_equity_curve.png")
+            
+            if os.path.exists(images_dir):
+                image_logger.info(f"检查备份图像目录: {images_dir}")
+                image_logger.info(f"备份对比图路径: {backup_comparison_path}, 是否存在: {os.path.exists(backup_comparison_path)}")
+                image_logger.info(f"备份最佳方法图路径: {backup_best_method_path}, 是否存在: {os.path.exists(backup_best_method_path)}")
+                
+                # 如果报告目录中没有图片但备份目录有，尝试复制
+                if not os.path.exists(hybrid_comparison_path) and os.path.exists(backup_comparison_path):
+                    try:
+                        import shutil
+                        shutil.copy(backup_comparison_path, hybrid_comparison_path)
+                        image_logger.info(f"已从备份目录复制对比图到报告目录")
+                    except Exception as e:
+                        image_logger.error(f"复制对比图失败: {str(e)}")
+                
+                if not os.path.exists(best_method_path) and os.path.exists(backup_best_method_path):
+                    try:
+                        import shutil
+                        shutil.copy(backup_best_method_path, best_method_path)
+                        image_logger.info(f"已从备份目录复制最佳方法图到报告目录")
+                    except Exception as e:
+                        image_logger.error(f"复制最佳方法图失败: {str(e)}")
 
             # 保存报告
             report_path = get_report_path("hybrid_strategy_report.md", subdirectory=output_subdir)
@@ -690,5 +961,11 @@ def run_hybrid_strategy(args):
 
 if __name__ == "__main__":
     args = parse_args()
+    
+    # 初始化图像调试日志
+    image_debug_logger = setup_image_debug_logger()
+    image_debug_logger.info(f"图像调试日志已初始化，开始运行混合策略回测: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    image_debug_logger.debug(f"命令行参数: {args}")
+    
     success = run_hybrid_strategy(args)
     sys.exit(0 if success else 1) 

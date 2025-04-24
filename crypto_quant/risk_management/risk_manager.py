@@ -29,6 +29,7 @@ class RiskManager:
         time_stop_bars: Optional[int] = None,    # 时间止损(K线数)
         consecutive_losses: int = 3,             # 允许连续亏损次数
         volatility_lookback: int = 20,           # 波动率计算回看周期
+        min_lookback: int = 5,                   # 最小回看周期（用于渐进式风险管理）
         volatility_scale_factor: float = 3.0,    # 波动率调整系数
         recovery_factor: float = 0.5,            # 回撤恢复系数
         use_atr_for_stops: bool = True,          # 是否使用ATR动态调整止损
@@ -51,6 +52,7 @@ class RiskManager:
             time_stop_bars: 时间止损K线数，持仓超过此K线数自动平仓，None表示不使用
             consecutive_losses: 允许的最大连续亏损次数，超过此值降低仓位
             volatility_lookback: 计算波动率的回看周期
+            min_lookback: 最小回看周期，用于渐进式风险管理
             volatility_scale_factor: 波动率调整系数，波动率越高，持仓规模越小
             recovery_factor: 从大回撤中恢复时的仓位调整系数
             use_atr_for_stops: 是否使用ATR动态调整止损
@@ -69,6 +71,7 @@ class RiskManager:
         self.time_stop_bars = time_stop_bars
         self.consecutive_losses = consecutive_losses
         self.volatility_lookback = volatility_lookback
+        self.min_lookback = min_lookback
         self.volatility_scale_factor = volatility_scale_factor
         self.recovery_factor = recovery_factor
         self.use_atr_for_stops = use_atr_for_stops
@@ -131,7 +134,7 @@ class RiskManager:
     
     def calculate_position_size(self, account_value: float, df: pd.DataFrame, current_index: int) -> float:
         """
-        根据市场波动率和账户状态计算头寸大小
+        根据市场波动率和账户状态计算头寸大小，支持渐进式风险管理
         
         Args:
             account_value: 当前账户价值
@@ -144,20 +147,42 @@ class RiskManager:
         # 默认使用基础仓位
         position_size = self.base_position_size
         
-        # 如果数据不足，返回基础仓位
-        if current_index < self.volatility_lookback or df.empty:
-            self.logger.debug(f"数据点不足，使用基础仓位: {position_size:.2%}")
+        # 如果数据完全不足，返回基础仓位
+        if df.empty or current_index <= 1:
+            self.logger.debug(f"数据点完全不足，使用基础仓位: {position_size:.2%}")
             return min(position_size, self.max_position_size)
         
         try:
-            # 计算最近的波动率(使用收盘价的标准差)
-            recent_volatility = df['close'].iloc[current_index-self.volatility_lookback:current_index].pct_change().std()
+            # 实现渐进式风险管理：根据可用数据点动态调整计算方法
+            available_points = min(current_index, len(df) - 1)
+            
+            # 如果数据点少于最小要求，使用渐进式风险管理
+            if available_points < self.volatility_lookback:
+                # 使用可用的数据点，但不少于最小回看期
+                actual_lookback = max(available_points, self.min_lookback)
+                
+                if actual_lookback < self.min_lookback:
+                    self.logger.debug(f"数据点不足，使用基础仓位: {position_size:.2%}")
+                    return min(position_size, self.max_position_size)
+                
+                # 对较短的数据序列减少波动率调整系数（更保守的调整）
+                adjusted_scale_factor = self.volatility_scale_factor * (actual_lookback / self.volatility_lookback)
+                
+                self.logger.debug(f"使用渐进式风险管理: 可用数据点={available_points}, 实际回溯={actual_lookback}, 调整后波动率系数={adjusted_scale_factor:.2f}")
+                
+                # 计算波动率，使用实际可用的数据点
+                recent_volatility = df['close'].iloc[current_index-actual_lookback:current_index].pct_change().std()
+            else:
+                # 数据充足，使用完整的波动率计算
+                actual_lookback = self.volatility_lookback
+                adjusted_scale_factor = self.volatility_scale_factor
+                recent_volatility = df['close'].iloc[current_index-self.volatility_lookback:current_index].pct_change().std()
             
             # 波动率正常化(避免极端值)
             normalized_volatility = min(max(recent_volatility, 0.005), 0.05)
             
             # 波动率越高，头寸越小
-            volatility_factor = 1.0 / (1.0 + self.volatility_scale_factor * normalized_volatility)
+            volatility_factor = 1.0 / (1.0 + adjusted_scale_factor * normalized_volatility)
             
             # 考虑当前回撤状态
             if self.drawdown_position_reduce and self._current_drawdown > 0:
