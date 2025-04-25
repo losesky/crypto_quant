@@ -153,7 +153,7 @@ class EnhancedLSTMStrategy:
             list: 预测结果列表
         """
         if not self._is_trained:
-            logger.warning("LSTM模型未训练，无法进行可靠预测")
+            logger.info("[自动训练] LSTM模型未训练，无法进行可靠预测，请先训练模型")
             return []
             
         predictions = self.predictor.predict_next_day(df, n_steps=n_steps)
@@ -175,7 +175,7 @@ class EnhancedLSTMStrategy:
         
         # 确保LSTM模型已训练
         if not self._is_trained:
-            logger.warning("LSTM模型未训练，将进行实时训练")
+            logger.info("[自动训练] LSTM模型未训练，系统将自动进行实时训练（设计特性）")
             # 训练整个数据集以确保特征工程一致性
             self.train(df)
         

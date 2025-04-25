@@ -207,6 +207,38 @@ class EnhancedLSTMPricePredictor:
             if not isinstance(df_processed.index, pd.DatetimeIndex):
                 df_processed.index = pd.to_datetime(df_processed.index)
             
+            # 预处理分类特征 - 处理字符串类型的列（如market_regime）
+            # 将常见的分类特征转换为数值
+            categorical_columns = df_processed.select_dtypes(include=['object', 'category']).columns
+            for col in categorical_columns:
+                if col == 'market_regime':
+                    # 专门处理market_regime列
+                    regime_map = {
+                        'trending_volatile': 3, 
+                        'ranging_volatile': 2, 
+                        'trending_stable': 1, 
+                        'ranging_stable': 0,
+                        'unknown': -1
+                    }
+                    if 'market_regime_num' not in df_processed.columns:
+                        df_processed['market_regime_num'] = df_processed[col].map(regime_map).fillna(-1)
+                    # 删除原始字符串列
+                    df_processed = df_processed.drop(col, axis=1)
+                    logger.info(f"已将 '{col}' 转换为数值特征 'market_regime_num'")
+                elif df_processed[col].nunique() <= 30:  # 只处理值不太多的分类特征
+                    try:
+                        # 使用类别编码
+                        df_processed[f'{col}_encoded'] = pd.Categorical(df_processed[col]).codes
+                        df_processed = df_processed.drop(col, axis=1)
+                        logger.info(f"已将分类特征 '{col}' 编码为数值")
+                    except Exception as e:
+                        logger.warning(f"无法编码分类特征 '{col}': {str(e)}")
+                        df_processed = df_processed.drop(col, axis=1)
+                else:
+                    # 分类值太多，直接删除
+                    logger.warning(f"分类特征 '{col}' 有太多唯一值 ({df_processed[col].nunique()})，将被移除")
+                    df_processed = df_processed.drop(col, axis=1)
+            
             # 价格特征
             df_processed['log_return'] = np.log(df_processed['close'] / df_processed['close'].shift(1))
             df_processed['price_range'] = (df_processed['high'] - df_processed['low']) / df_processed['close']
@@ -246,6 +278,12 @@ class EnhancedLSTMPricePredictor:
             df_processed['day_of_week'] = df_processed.index.dayofweek.astype(float)
             df_processed['month'] = df_processed.index.month.astype(float)
             df_processed['day_of_month'] = df_processed.index.day.astype(float)
+            
+            # 最后的检查 - 确保所有列都是数值型
+            non_numeric_cols = df_processed.select_dtypes(exclude=['number']).columns.tolist()
+            if non_numeric_cols:
+                logger.warning(f"依然存在非数值特征，将被移除: {non_numeric_cols}")
+                df_processed = df_processed.drop(non_numeric_cols, axis=1)
             
             # 去除NaN值
             df_processed = df_processed.fillna(method='bfill').fillna(method='ffill')
@@ -1067,8 +1105,25 @@ class EnhancedLSTMPricePredictor:
         exclude_cols = ['day_of_week', 'month']
         features_cols = [col for col in processed_df.columns if col != target_column and col not in exclude_cols]
         
-        # 计算特征与目标的相关性
-        correlations = processed_df[features_cols + [target_column]].corr()[target_column].drop(target_column)
+        # 移除所有非数值型列，避免计算相关系数时出错
+        numeric_cols = processed_df.select_dtypes(include=['number']).columns.tolist()
+        numeric_features = [col for col in features_cols if col in numeric_cols]
+        
+        if target_column not in numeric_cols:
+            logger.error(f"目标列 {target_column} 不是数值类型，无法计算相关性")
+            return None
+            
+        # 检查是否有被排除的特征
+        excluded_features = [col for col in features_cols if col not in numeric_features]
+        if excluded_features:
+            logger.warning(f"以下非数值特征将被排除在相关性计算之外: {excluded_features}")
+        
+        if len(numeric_features) == 0:
+            logger.error("没有可用的数值型特征，无法计算相关性")
+            return None
+        
+        # 计算特征与目标的相关性 - 仅使用数值列
+        correlations = processed_df[numeric_features + [target_column]].corr()[target_column].drop(target_column)
         
         # 计算绝对相关性
         abs_correlations = correlations.abs().sort_values(ascending=False)

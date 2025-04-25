@@ -156,7 +156,42 @@ class MACDLSTMHybridStrategy:
     
     def _detect_market_regime(self, df: pd.DataFrame) -> str:
         """
-        检测市场状态：上升趋势、下降趋势或横盘
+        检测市场状态：使用多种技术指标进行更精确的市场状态判断
+        
+        Args:
+            df: 历史数据DataFrame
+            
+        Returns:
+            str: 市场状态 - 'trending_volatile', 'ranging_volatile', 'trending_stable', 'ranging_stable'
+        """
+        try:
+            # 导入技术指标计算类
+            from ...indicators.technical_indicators import TechnicalIndicators
+            
+            # 使用技术指标模块进行市场状态判断
+            market_regime = TechnicalIndicators.identify_market_regime(
+                df, 
+                volatility_threshold=self.market_regime_threshold,
+                trend_threshold=25,  # ADX阈值
+                fast_ma_period=10,
+                slow_ma_period=self.moving_average_period
+            )
+            
+            logger.info(f"识别到的市场状态: {market_regime}")
+            return market_regime
+            
+        except ImportError:
+            logger.warning("技术指标模块导入失败，使用基础市场状态判断")
+            # 回退到基础判断逻辑
+            return self._basic_market_regime_detection(df)
+        except Exception as e:
+            logger.error(f"市场状态判断出错: {str(e)}")
+            # 回退到基础判断逻辑
+            return self._basic_market_regime_detection(df)
+    
+    def _basic_market_regime_detection(self, df: pd.DataFrame) -> str:
+        """
+        基础的市场状态检测逻辑
         
         Args:
             df: 历史数据DataFrame
@@ -183,6 +218,98 @@ class MACDLSTMHybridStrategy:
             return 'downtrend'
         else:
             return 'sideways'
+    
+    def _calculate_market_features(self, df: pd.DataFrame, row_index: int) -> dict:
+        """
+        计算当前时间点的市场特征
+        
+        Args:
+            df: 历史数据DataFrame
+            row_index: 当前行索引
+            
+        Returns:
+            dict: 市场特征字典
+        """
+        # 如果数据不足，返回基本特征
+        if row_index < 50:
+            return self._calculate_simple_features(df, row_index)
+        
+        # 尝试计算更复杂的市场特征
+        try:
+            from ...indicators.technical_indicators import TechnicalIndicators
+            
+            # 获取历史数据窗口
+            hist_window = df.iloc[:row_index+1].copy()
+            
+            # 识别市场状态
+            market_regime = TechnicalIndicators.identify_market_regime(hist_window)
+            
+            # 将市场状态转换为数值表示
+            regime_map = {
+                'trending_volatile': 3, 
+                'ranging_volatile': 2, 
+                'trending_stable': 1, 
+                'ranging_stable': 0,
+                'unknown': -1
+            }
+            market_regime_num = regime_map.get(market_regime, -1)
+            
+            # 计算其他市场特征
+            features = TechnicalIndicators.get_market_features(hist_window)
+            
+            # 确保所有特征值都是数值类型
+            for key, value in list(features.items()):
+                if not isinstance(value, (int, float, np.number)):
+                    # 如果是非数值类型，尝试转换或移除
+                    if key == 'market_regime':
+                        # 将市场状态转换为数值
+                        features['market_regime_num'] = market_regime_num
+                        del features[key]
+                    else:
+                        # 对于其他非数值特征，直接移除
+                        del features[key]
+            
+            # 添加最重要的市场状态数值表示
+            features['market_regime_num'] = market_regime_num
+            
+            return features
+            
+        except ImportError:
+            logger.warning("无法导入TechnicalIndicators，将使用简单特征")
+            return self._calculate_simple_features(df, row_index)
+        except Exception as e:
+            logger.error(f"计算市场特征时出错: {str(e)}")
+            return self._calculate_simple_features(df, row_index)
+    
+    def _calculate_simple_features(self, df: pd.DataFrame, row_index: int) -> dict:
+        """
+        计算简单的市场特征
+        
+        Args:
+            df: 历史数据DataFrame
+            row_index: 当前行索引
+            
+        Returns:
+            dict: 市场特征字典
+        """
+        features = {}
+        
+        # 确保数据点足够
+        if row_index < 5:
+            features['volatility'] = 0.01  # 默认低波动率
+            return features
+            
+        # 计算波动率
+        features['volatility'] = df['close'].iloc[max(0, row_index-20):row_index+1].pct_change().std()
+        
+        # 计算短期和长期移动平均
+        if row_index >= 10:
+            short_ma = df['close'].iloc[row_index-9:row_index+1].mean()
+            if row_index >= 50:
+                long_ma = df['close'].iloc[row_index-49:row_index+1].mean()
+                features['ma_trend'] = 1 if short_ma > long_ma else -1
+        
+        return features
     
     def _vote_ensemble(self, macd_signal: float, lstm_signal: float) -> float:
         """
@@ -259,7 +386,7 @@ class MACDLSTMHybridStrategy:
     
     def _expert_ensemble(self, macd_signal: float, lstm_signal: float, market_state: str) -> float:
         """
-        专家系统法：根据市场状态动态选择最适合的策略
+        改进的专家系统法：根据更精确的市场状态动态选择最适合的策略
         
         Args:
             macd_signal: MACD信号
@@ -269,17 +396,54 @@ class MACDLSTMHybridStrategy:
         Returns:
             float: 组合信号
         """
-        # 在上升趋势中，LSTM表现更好
-        if market_state == 'uptrend':
-            return lstm_signal
+        # 获取适合当前市场状态的权重
+        macd_weight, lstm_weight = self._get_adaptive_weights(market_state)
         
-        # 在下降趋势中，MACD表现更好
-        elif market_state == 'downtrend':
+        logger.debug(f"市场状态: {market_state}, MACD权重: {macd_weight}, LSTM权重: {lstm_weight}")
+        
+        # 应用加权组合
+        weighted_signal = macd_weight * macd_signal + lstm_weight * lstm_signal
+        
+        # 信号确定性级别 - 权重和信号强度都需要足够
+        if abs(weighted_signal) >= 0.3:
+            return 1.0 if weighted_signal > 0 else -1.0
+        
+        # 两个信号一致且非零时也生成交易信号
+        if macd_signal == lstm_signal and macd_signal != 0:
             return macd_signal
+            
+        # 信号不确定时保持观望
+        return 0.0
+    
+    def _get_adaptive_weights(self, market_state: str) -> Tuple[float, float]:
+        """
+        根据市场状态自适应调整策略权重
         
-        # 在横盘市场中，使用投票法（要求一致）
+        Args:
+            market_state: 市场状态
+            
+        Returns:
+            Tuple[float, float]: (MACD权重, LSTM权重)
+        """
+        # 针对不同市场状态优化权重配置
+        if market_state in ('trending_volatile', 'ranging_volatile', 'trending_stable', 'ranging_stable'):
+            # 新的四分类市场状态
+            weights = {
+                'trending_volatile': (0.3, 0.7),  # 波动趋势市场优先LSTM
+                'ranging_volatile': (0.2, 0.8),   # 波动震荡市场强依赖LSTM
+                'trending_stable': (0.7, 0.3),    # 稳定趋势市场优先MACD
+                'ranging_stable': (0.5, 0.5)      # 稳定震荡市场平衡配置
+            }
+            return weights.get(market_state, self.ensemble_weights)
+            
         else:
-            return self._vote_ensemble(macd_signal, lstm_signal)
+            # 兼容旧版市场状态
+            weights = {
+                'uptrend': (0.4, 0.6),      # 上升趋势市场，LSTM稍占优
+                'downtrend': (0.6, 0.4),    # 下降趋势市场，MACD稍占优
+                'sideways': (0.5, 0.5)      # 横盘市场，平衡配置
+            }
+            return weights.get(market_state, self.ensemble_weights)
     
     def generate_signals(self, df: pd.DataFrame = None) -> pd.DataFrame:
         """
@@ -350,6 +514,18 @@ class MACDLSTMHybridStrategy:
                 macd_signal = df['macd_position'].iloc[i]
                 lstm_signal = df['lstm_position'].iloc[i]
                 
+                # 获取当前市场特征
+                market_features = self._calculate_market_features(df, i)
+                
+                # 存储市场特征
+                for key, value in market_features.items():
+                    if f'market_{key}' not in df.columns:
+                        df[f'market_{key}'] = None
+                    df.at[df.index[i], f'market_{key}'] = value
+                
+                # 获取当前市场状态
+                current_market_state = market_features.get('market_regime', self._market_state)
+                
                 # 基于选择的组合方法组合信号
                 if self.ensemble_method == 'vote':
                     signal = self._vote_ensemble(macd_signal, lstm_signal)
@@ -358,7 +534,7 @@ class MACDLSTMHybridStrategy:
                 elif self.ensemble_method == 'layered':
                     signal = self._layered_ensemble(macd_signal, lstm_signal, i, df)
                 elif self.ensemble_method == 'expert':
-                    signal = self._expert_ensemble(macd_signal, lstm_signal, self._market_state)
+                    signal = self._expert_ensemble(macd_signal, lstm_signal, current_market_state)
                 else:
                     logger.warning(f"未知的组合方法: {self.ensemble_method}，使用投票法")
                     signal = self._vote_ensemble(macd_signal, lstm_signal)
