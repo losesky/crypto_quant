@@ -12,22 +12,37 @@ from ...utils.logger import logger
 # 检查是否有中文字体可用
 def check_chinese_font():
     """检查系统中是否有可用的中文字体"""
-    chinese_fonts = ['SimHei', 'Microsoft YaHei', 'Noto Sans CJK SC', 'Source Han Sans CN', 'WenQuanYi Micro Hei']
-    for font_name in chinese_fonts:
-        try:
-            font_prop = FontProperties(fname=font_name)
-            if font_prop is not None:
-                return True, font_name
-        except:
-            continue
-    return False, None
+    try:
+        # 首先尝试导入FontHelper
+        from ...utils.font_helper import get_font_helper
+        font_helper = get_font_helper()
+        return font_helper.has_chinese_font, font_helper.chinese_font
+    except ImportError:
+        # 如果无法导入，使用简化的检测方法
+        chinese_fonts = ['SimHei', 'Microsoft YaHei', 'Noto Sans CJK SC', 'Source Han Sans CN', 'WenQuanYi Micro Hei']
+        for font_name in chinese_fonts:
+            try:
+                font_prop = FontProperties(fname=font_name)
+                if font_prop is not None:
+                    return True, font_name
+            except:
+                continue
+        return False, None
 
 # 全局检查中文字体可用性
 HAS_CHINESE_FONT, CHINESE_FONT_NAME = check_chinese_font()
 
 # 如果找到中文字体，设置为默认字体
 if HAS_CHINESE_FONT:
-    plt.rcParams['font.family'] = [CHINESE_FONT_NAME]
+    try:
+        plt.rcParams['font.family'] = ['sans-serif']
+        if isinstance(CHINESE_FONT_NAME, str):
+            plt.rcParams['font.sans-serif'] = [CHINESE_FONT_NAME, 'SimHei', 'Arial Unicode MS'] + plt.rcParams['font.sans-serif']
+        plt.rcParams['axes.unicode_minus'] = False
+        logger.info(f"已设置默认中文字体: {CHINESE_FONT_NAME}")
+    except Exception as e:
+        logger.warning(f"设置默认中文字体失败: {str(e)}")
+        HAS_CHINESE_FONT = False
 
 
 class BacktestEngine:
@@ -177,81 +192,146 @@ class BacktestEngine:
     def plot_results(self, figsize=(12, 10)):
         """
         绘制回测结果图表
-
+        
         Args:
-            figsize (tuple): 图表尺寸
-
+            figsize (tuple, optional): 图表大小
+            
         Returns:
             matplotlib.figure.Figure: 图表对象
         """
         if self.results is None:
-            logger.error("Cannot plot chart: Please run backtest first")
+            logger.error("Cannot plot: No backtest results available.")
             return None
-
-        fig, axes = plt.subplots(4, 1, figsize=figsize, sharex=True, gridspec_kw={'height_ratios': [3, 1, 1, 1]})
         
-        # 根据是否有中文字体支持选择标题语言
-        if HAS_CHINESE_FONT:
-            title = f"策略回测结果: {self.strategy.name}"
-            position_title = "仓位变化"
-            drawdown_title = "回撤"
-            indicator_title = "MACD指标"
-            price_label = "价格"
-            equity_label = "资金曲线"
-            peaks_label = "历史高点"
-            position_label = "仓位"
-            drawdown_label = "回撤 (%)"
-        else:
-            title = f"Strategy Backtest Results: {self.strategy.name}"
-            position_title = "Position Changes"
-            drawdown_title = "Drawdown"
-            indicator_title = "MACD Indicator"
-            price_label = "Price"
-            equity_label = "Equity Curve"
-            peaks_label = "Previous Peaks"
-            position_label = "Position"
-            drawdown_label = "Drawdown (%)"
+        fig, (ax1, ax2, ax3, ax4) = plt.subplots(4, 1, figsize=figsize, sharex=True, gridspec_kw={'height_ratios': [2, 1, 1, 1]})
         
-        # 绘制价格和策略资金曲线
-        ax1 = axes[0]
-        ax1.set_title(title)
-        ax1.plot(self.results.index, self.results['close'], color='blue', alpha=0.3, label=price_label)
-        ax1_twin = ax1.twinx()
-        ax1_twin.plot(self.results.index, self.results['equity_curve'], color='green', label=equity_label)
-        ax1_twin.plot(self.results.index, self.results['previous_peaks'], color='red', linestyle='--', alpha=0.5, label=peaks_label)
+        # 检查全局字体助手是否可用
+        try:
+            from ...utils.font_helper import get_font_helper
+            font_helper = get_font_helper()
+            has_chinese_font = font_helper.has_chinese_font
+        except ImportError:
+            has_chinese_font = HAS_CHINESE_FONT
+            font_helper = None
         
-        # 合并图例
-        lines1, labels1 = ax1.get_legend_handles_labels()
-        lines2, labels2 = ax1_twin.get_legend_handles_labels()
-        ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
+        # 设置标题文字（中英文）
+        zh_titles = {
+            'price': '价格与交易信号',
+            'equity': '权益曲线',
+            'drawdown': '回撤',
+            'position': '仓位变化'
+        }
         
-        # 绘制仓位变化
-        ax2 = axes[1]
-        ax2.set_title(position_title)
-        ax2.plot(self.results.index, self.results['position'], color='purple')
-        ax2.set_ylabel(position_label)
-        ax2.set_ylim(-1.1, 1.1)
+        en_titles = {
+            'price': 'Price and Trading Signals',
+            'equity': 'Equity Curve',
+            'drawdown': 'Drawdown',
+            'position': 'Position Changes'
+        }
+        
+        # 使用中文或英文标题
+        titles = zh_titles if has_chinese_font else en_titles
+        
+        # 绘制价格和交易点
+        ax1.plot(self.results.index, self.results['close'], label='价格' if has_chinese_font else 'Price')
+        
+        # 标记买入点
+        buy_signals = self.results[self.results['signal'] > 0].index
+        sell_signals = self.results[self.results['signal'] < 0].index
+        
+        if len(buy_signals) > 0:
+            ax1.scatter(buy_signals, self.results.loc[buy_signals, 'close'], 
+                       marker='^', color='green', s=100, label='买入' if has_chinese_font else 'Buy')
+        
+        if len(sell_signals) > 0:
+            ax1.scatter(sell_signals, self.results.loc[sell_signals, 'close'], 
+                       marker='v', color='red', s=100, label='卖出' if has_chinese_font else 'Sell')
+        
+        # 设置标题和图例
+        ax1.set_title(titles['price'])
+        ax1.legend(loc='upper left')
+        ax1.grid(True)
+        
+        # 绘制权益曲线
+        if 'equity_curve' in self.results.columns:
+            ax2.plot(self.results.index, self.results['equity_curve'], label='策略' if has_chinese_font else 'Strategy', color='blue')
+            
+            if 'benchmark_equity' in self.results.columns:
+                ax2.plot(self.results.index, self.results['benchmark_equity'], 
+                        label='基准' if has_chinese_font else 'Benchmark', color='gray', linestyle='--')
+        elif 'cumulative_strategy_returns' in self.results.columns:
+            ax2.plot(self.results.index, self.results['cumulative_strategy_returns'], 
+                    label='策略' if has_chinese_font else 'Strategy', color='blue')
+            
+            if 'cumulative_returns' in self.results.columns:
+                ax2.plot(self.results.index, self.results['cumulative_returns'], 
+                        label='基准' if has_chinese_font else 'Benchmark', color='gray', linestyle='--')
+        
+        ax2.set_title(titles['equity'])
+        ax2.legend(loc='upper left')
         ax2.grid(True)
         
         # 绘制回撤
-        ax3 = axes[2]
-        ax3.set_title(drawdown_title)
-        ax3.fill_between(self.results.index, self.results['drawdown'], 0, color='red', alpha=0.3)
-        ax3.set_ylabel(drawdown_label)
-        ax3.set_ylim(-1, 0)
-        ax3.grid(True)
+        if 'drawdown' in self.results.columns:
+            ax3.fill_between(self.results.index, self.results['drawdown'] * 100, 0, 
+                            color='red', alpha=0.3, label='回撤 %' if has_chinese_font else 'Drawdown %')
+            ax3.set_title(titles['drawdown'])
+            ax3.legend(loc='upper left')
+            ax3.grid(True)
         
-        # 绘制MACD
-        ax4 = axes[3]
-        ax4.set_title(indicator_title)
-        ax4.plot(self.results.index, self.results['macd'], label='MACD', color='blue')
-        ax4.plot(self.results.index, self.results['signal_line'], label='Signal Line', color='red')
-        ax4.bar(self.results.index, self.results['histogram'], label='Histogram', color='green', alpha=0.5, width=0.5)
+        # 绘制仓位变化
+        if 'position' in self.results.columns:
+            ax4.plot(self.results.index, self.results['position'], label='仓位' if has_chinese_font else 'Position')
+            ax4.set_title(titles['position'])
+        
+        # 如果是MACD策略，添加MACD指标
+        if 'macd' in self.results.columns and 'signal_line' in self.results.columns:
+            # 创建次坐标轴
+            ax5 = ax4.twinx()
+            ax5.plot(self.results.index, self.results['macd'], label='MACD', color='blue')
+            ax5.plot(self.results.index, self.results['signal_line'], label='Signal', color='red')
+            ax5.bar(self.results.index, self.results['histogram'], label='Hist', color='gray', alpha=0.3)
+            ax5.legend(loc='upper right')
+        
         ax4.legend(loc='upper left')
         ax4.grid(True)
         
         # 调整布局
         plt.tight_layout()
+        
+        # 应用字体到整个图表
+        if font_helper:
+            try:
+                font_helper.apply_font_to_figure(fig)
+                logger.info("已应用字体助手到图表")
+            except Exception as e:
+                logger.warning(f"应用字体助手到图表失败: {str(e)}")
+        elif has_chinese_font and CHINESE_FONT_NAME:
+            try:
+                # 手动应用中文字体
+                for ax in fig.axes:
+                    title = ax.get_title()
+                    if title:
+                        ax.set_title(title, fontproperties=FontProperties(fname=CHINESE_FONT_NAME))
+                    
+                    # 处理坐标轴标签
+                    xlabel = ax.get_xlabel()
+                    if xlabel:
+                        ax.set_xlabel(xlabel, fontproperties=FontProperties(fname=CHINESE_FONT_NAME))
+                    
+                    ylabel = ax.get_ylabel()
+                    if ylabel:
+                        ax.set_ylabel(ylabel, fontproperties=FontProperties(fname=CHINESE_FONT_NAME))
+                    
+                    # 处理图例
+                    legend = ax.get_legend()
+                    if legend:
+                        for text in legend.get_texts():
+                            text.set_fontproperties(FontProperties(fname=CHINESE_FONT_NAME))
+            
+                logger.info("已手动应用中文字体到图表")
+            except Exception as e:
+                logger.warning(f"手动应用中文字体到图表失败: {str(e)}")
         
         return fig
 

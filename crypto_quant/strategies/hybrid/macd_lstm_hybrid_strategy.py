@@ -162,30 +162,62 @@ class MACDLSTMHybridStrategy:
             df: 历史数据DataFrame
             
         Returns:
-            str: 市场状态 - 'trending_volatile', 'ranging_volatile', 'trending_stable', 'ranging_stable'
+            str: 市场状态 - 'strong_uptrend', 'strong_downtrend', 'volatile_range', 'tight_range'
         """
         try:
-            # 导入技术指标计算类
-            from ...indicators.technical_indicators import TechnicalIndicators
+            # 尝试使用新的市场状态分类器
+            from ...analysis.market_regime_classifier import MarketRegimeClassifier
             
-            # 使用技术指标模块进行市场状态判断
-            market_regime = TechnicalIndicators.identify_market_regime(
-                df, 
+            # 初始化分类器（使用实例参数）
+            classifier = MarketRegimeClassifier(
+                adx_threshold=25.0,
                 volatility_threshold=self.market_regime_threshold,
-                trend_threshold=25,  # ADX阈值
-                fast_ma_period=10,
-                slow_ma_period=self.moving_average_period
+                visualization_enabled=False
             )
             
-            logger.info(f"识别到的市场状态: {market_regime}")
+            # 分类最新的市场状态
+            market_regime = classifier.classify(df)
+            
+            logger.info(f"使用MarketRegimeClassifier识别到的市场状态: {market_regime}")
             return market_regime
             
         except ImportError:
-            logger.warning("技术指标模块导入失败，使用基础市场状态判断")
-            # 回退到基础判断逻辑
-            return self._basic_market_regime_detection(df)
+            logger.warning("MarketRegimeClassifier导入失败，尝试使用技术指标模块")
+            # 尝试使用技术指标模块
+            try:
+                from ...indicators.technical_indicators import TechnicalIndicators
+                
+                # 使用技术指标模块进行市场状态判断
+                market_regime = TechnicalIndicators.identify_market_regime(
+                    df, 
+                    volatility_threshold=self.market_regime_threshold,
+                    trend_threshold=25,  # ADX阈值
+                    fast_ma_period=10,
+                    slow_ma_period=self.moving_average_period
+                )
+                
+                # 映射到新的市场状态格式
+                regime_mapping = {
+                    'trending_volatile': 'strong_uptrend' if df['close'].iloc[-1] > df['close'].iloc[-20] else 'strong_downtrend',
+                    'ranging_volatile': 'volatile_range',
+                    'trending_stable': 'strong_uptrend' if df['close'].iloc[-1] > df['close'].iloc[-20] else 'strong_downtrend',
+                    'ranging_stable': 'tight_range'
+                }
+                
+                new_regime = regime_mapping.get(market_regime, market_regime)
+                logger.info(f"使用TechnicalIndicators识别到的市场状态: {market_regime} -> 映射为: {new_regime}")
+                return new_regime
+                
+            except ImportError:
+                logger.warning("技术指标模块导入失败，使用基础市场状态判断")
+                # 回退到基础判断逻辑
+                return self._basic_market_regime_detection(df)
+            except Exception as e:
+                logger.error(f"市场状态判断出错: {str(e)}")
+                # 回退到基础判断逻辑
+                return self._basic_market_regime_detection(df)
         except Exception as e:
-            logger.error(f"市场状态判断出错: {str(e)}")
+            logger.error(f"使用市场状态分类器出错: {str(e)}")
             # 回退到基础判断逻辑
             return self._basic_market_regime_detection(df)
     
@@ -197,7 +229,7 @@ class MACDLSTMHybridStrategy:
             df: 历史数据DataFrame
             
         Returns:
-            str: 市场状态 - 'uptrend', 'downtrend', 'sideways'
+            str: 市场状态 - 'strong_uptrend', 'strong_downtrend', 'volatile_range', 'tight_range'
         """
         # 计算移动平均线
         if f'ma_{self.moving_average_period}' not in df.columns:
@@ -212,12 +244,18 @@ class MACDLSTMHybridStrategy:
         volatility = df['close'].pct_change().rolling(window=20).std().iloc[-1]
         
         # 根据偏差和波动率判断市场状态
-        if deviation > self.market_regime_threshold:
-            return 'uptrend'
-        elif deviation < -self.market_regime_threshold:
-            return 'downtrend'
+        if abs(deviation) > self.market_regime_threshold:
+            # 有明显趋势
+            if deviation > 0:
+                return 'strong_uptrend'  # 强上升趋势
+            else:
+                return 'strong_downtrend'  # 强下降趋势
         else:
-            return 'sideways'
+            # 无明显趋势（区间震荡）
+            if volatility > self.market_regime_threshold / 3:  # 波动率阈值取市场状态阈值的1/3
+                return 'volatile_range'  # 高波动区间震荡
+            else:
+                return 'tight_range'  # 低波动区间震荡
     
     def _calculate_market_features(self, df: pd.DataFrame, row_index: int) -> dict:
         """
@@ -365,29 +403,93 @@ class MACDLSTMHybridStrategy:
         if row_index < 1:
             return 0.0
         
-        # 获取之前的MACD趋势
-        prev_macd_hist = df['macd_hist'].iloc[row_index-1]
-        curr_macd_hist = df['macd_hist'].iloc[row_index]
-        
-        # MACD直方图上穿零轴，确认上升趋势
-        if prev_macd_hist <= 0 and curr_macd_hist > 0:
-            # 当LSTM也看涨时确认买入
-            if lstm_signal > 0:
-                return 1.0
-        
-        # MACD直方图下穿零轴，确认下降趋势
-        elif prev_macd_hist >= 0 and curr_macd_hist < 0:
-            # 当LSTM也看跌时确认卖出
-            if lstm_signal < 0:
-                return -1.0
+        try:
+            # 检查并处理列名不一致的情况
+            macd_hist_column = None
+            if 'macd_hist' in df.columns:
+                macd_hist_column = 'macd_hist'
+            elif 'histogram' in df.columns:
+                macd_hist_column = 'histogram'
+                logger.info("在_layered_ensemble方法中使用histogram列代替macd_hist")
+            else:
+                # 尝试根据其他列创建MACD柱状图
+                if 'macd' in df.columns and 'macd_signal' in df.columns:
+                    logger.info("从MACD和信号线计算MACD柱状图")
+                    df['calculated_hist'] = df['macd'] - df['macd_signal']
+                    macd_hist_column = 'calculated_hist'
+                elif 'close' in df.columns:
+                    # 如果都不存在，但我们有收盘价，尝试计算简化版的MACD
+                    logger.warning("找不到MACD柱状图数据，尝试计算简化版MACD")
+                    try:
+                        # 计算简化版的MACD
+                        short_ma = df['close'].rolling(window=12).mean()
+                        long_ma = df['close'].rolling(window=26).mean()
+                        df['simple_macd'] = short_ma - long_ma
+                        df['simple_signal'] = df['simple_macd'].rolling(window=9).mean()
+                        df['simple_hist'] = df['simple_macd'] - df['simple_signal']
+                        macd_hist_column = 'simple_hist'
+                    except Exception as e:
+                        logger.error(f"计算简化MACD时出错: {str(e)}")
+                        # 使用0值创建macd_hist列
+                        df['zero_hist'] = 0
+                        macd_hist_column = 'zero_hist'
+                else:
+                    logger.warning("找不到MACD柱状图数据且无法计算，将使用0值")
+                    df['zero_hist'] = 0
+                    macd_hist_column = 'zero_hist'
+            
+            # 确保选定的列存在
+            if macd_hist_column not in df.columns:
+                logger.error(f"选定的列 {macd_hist_column} 不存在，返回0信号")
+                return 0.0
+                
+            # 获取之前的MACD趋势
+            prev_macd_hist = df[macd_hist_column].iloc[row_index-1]
+            curr_macd_hist = df[macd_hist_column].iloc[row_index]
+            
+            # 处理NaN或者Inf值
+            if pd.isna(prev_macd_hist) or pd.isna(curr_macd_hist) or np.isinf(prev_macd_hist) or np.isinf(curr_macd_hist):
+                logger.warning(f"MACD柱状图数据包含无效值: 前值={prev_macd_hist}, 当前值={curr_macd_hist}")
+                # 尝试使用0替代无效值
+                if pd.isna(prev_macd_hist) or np.isinf(prev_macd_hist):
+                    prev_macd_hist = 0
+                if pd.isna(curr_macd_hist) or np.isinf(curr_macd_hist):
+                    curr_macd_hist = 0
+            
+            # MACD直方图上穿零轴，确认上升趋势
+            if prev_macd_hist <= 0 and curr_macd_hist > 0:
+                # 当LSTM也看涨时确认买入
+                if lstm_signal > 0:
+                    return 1.0
+            
+            # MACD直方图下穿零轴，确认下降趋势
+            elif prev_macd_hist >= 0 and curr_macd_hist < 0:
+                # 当LSTM也看跌时确认卖出
+                if lstm_signal < 0:
+                    return -1.0
+                    
+            # 当MACD柱状图持续增长，且LSTM信号为正时，考虑买入
+            elif curr_macd_hist > prev_macd_hist > 0 and lstm_signal > 0:
+                return 0.5  # 弱买入信号
+                
+            # 当MACD柱状图持续减小，且LSTM信号为负时，考虑卖出
+            elif curr_macd_hist < prev_macd_hist < 0 and lstm_signal < 0:
+                return -0.5  # 弱卖出信号
+            
+        except Exception as e:
+            logger.error(f"_layered_ensemble方法出错: {str(e)}")
+            # 打印完整的错误堆栈
+            import traceback
+            logger.error(traceback.format_exc())
+            return 0.0
         
         # 保持当前持仓
         return 0.0
     
     def _expert_ensemble(self, macd_signal: float, lstm_signal: float, market_state: str) -> float:
         """
-        改进的专家系统法：根据更精确的市场状态动态选择最适合的策略
-        
+        专家组合法：根据市场状态动态调整策略权重
+
         Args:
             macd_signal: MACD信号
             lstm_signal: LSTM信号
@@ -396,7 +498,7 @@ class MACDLSTMHybridStrategy:
         Returns:
             float: 组合信号
         """
-        # 获取适合当前市场状态的权重
+        # 获取基于当前市场状态的自适应权重
         macd_weight, lstm_weight = self._get_adaptive_weights(market_state)
         
         logger.debug(f"市场状态: {market_state}, MACD权重: {macd_weight}, LSTM权重: {lstm_weight}")
@@ -404,13 +506,31 @@ class MACDLSTMHybridStrategy:
         # 应用加权组合
         weighted_signal = macd_weight * macd_signal + lstm_weight * lstm_signal
         
-        # 信号确定性级别 - 权重和信号强度都需要足够
-        if abs(weighted_signal) >= 0.3:
+        # 信号确定性级别 - 根据市场状态调整确定性阈值
+        thresholds = {
+            'strong_uptrend': 0.25,   # 强趋势市场降低确定性要求
+            'strong_downtrend': 0.25, # 强趋势市场降低确定性要求
+            'volatile_range': 0.40,   # 高波动震荡市场提高确定性要求
+            'tight_range': 0.35,      # 低波动震荡市场适中确定性要求
+            'unknown': 0.35           # 未知状态使用默认值
+        }
+        
+        # 获取当前市场状态的阈值，如果未找到则使用默认值0.35
+        signal_threshold = thresholds.get(market_state, 0.35)
+        
+        # 应用阈值
+        if abs(weighted_signal) >= signal_threshold:
+            # 信号强度足够
             return 1.0 if weighted_signal > 0 else -1.0
         
-        # 两个信号一致且非零时也生成交易信号
+        # 两个信号一致且非零时，即使低于阈值也考虑生成信号（在某些市场状态下）
         if macd_signal == lstm_signal and macd_signal != 0:
-            return macd_signal
+            # 在强趋势市场，信号一致时更容易生成信号
+            if market_state in ('strong_uptrend', 'strong_downtrend'):
+                return macd_signal
+            # 在其他市场状态下，信号一致但仍需达到较低阈值
+            elif abs(weighted_signal) >= signal_threshold * 0.7:
+                return macd_signal
             
         # 信号不确定时保持观望
         return 0.0
@@ -425,25 +545,40 @@ class MACDLSTMHybridStrategy:
         Returns:
             Tuple[float, float]: (MACD权重, LSTM权重)
         """
-        # 针对不同市场状态优化权重配置
-        if market_state in ('trending_volatile', 'ranging_volatile', 'trending_stable', 'ranging_stable'):
-            # 新的四分类市场状态
-            weights = {
-                'trending_volatile': (0.3, 0.7),  # 波动趋势市场优先LSTM
-                'ranging_volatile': (0.2, 0.8),   # 波动震荡市场强依赖LSTM
-                'trending_stable': (0.7, 0.3),    # 稳定趋势市场优先MACD
-                'ranging_stable': (0.5, 0.5)      # 稳定震荡市场平衡配置
-            }
-            return weights.get(market_state, self.ensemble_weights)
+        # 针对新的四分类市场状态优化权重配置
+        weights = {
+            'strong_uptrend': (0.7, 0.3),    # 强上升趋势优先MACD
+            'strong_downtrend': (0.7, 0.3),  # 强下降趋势优先MACD
+            'volatile_range': (0.2, 0.8),    # 高波动震荡市场优先LSTM
+            'tight_range': (0.5, 0.5)        # 低波动震荡市场平衡配置
+        }
+        
+        # 获取对应市场状态的权重，如果未找到则使用默认权重
+        return weights.get(market_state, self.ensemble_weights)
+
+    # 如果需要同时兼容旧的市场状态名称，可以添加以下代码
+    def _convert_old_market_state(self, market_state: str) -> str:
+        """
+        将旧的市场状态名称转换为新的市场状态名称
+        
+        Args:
+            market_state: 旧市场状态
             
-        else:
-            # 兼容旧版市场状态
-            weights = {
-                'uptrend': (0.4, 0.6),      # 上升趋势市场，LSTM稍占优
-                'downtrend': (0.6, 0.4),    # 下降趋势市场，MACD稍占优
-                'sideways': (0.5, 0.5)      # 横盘市场，平衡配置
-            }
-            return weights.get(market_state, self.ensemble_weights)
+        Returns:
+            str: 新市场状态
+        """
+        # 映射旧的市场状态到新的市场状态
+        state_mapping = {
+            'uptrend': 'strong_uptrend',
+            'downtrend': 'strong_downtrend',
+            'sideways': 'tight_range',
+            'trending_volatile': 'strong_uptrend',
+            'ranging_volatile': 'volatile_range',
+            'trending_stable': 'strong_uptrend',
+            'ranging_stable': 'tight_range'
+        }
+        
+        return state_mapping.get(market_state, market_state)
     
     def generate_signals(self, df: pd.DataFrame = None) -> pd.DataFrame:
         """
@@ -485,26 +620,40 @@ class MACDLSTMHybridStrategy:
             lstm_df = self.lstm_strategy.generate_signals(df)
             
             # 合并信号到原始DataFrame
-            if 'macd' in macd_df.columns:
-                df['macd'] = macd_df['macd']
-            if 'macd_signal' in macd_df.columns:
-                df['macd_signal'] = macd_df['macd_signal']
-            if 'macd_hist' in macd_df.columns:
-                df['macd_hist'] = macd_df['macd_hist']
-            if 'position' in macd_df.columns:
-                df['macd_position'] = macd_df['position']
-            if 'position' in lstm_df.columns:
-                df['lstm_position'] = lstm_df['position']
-            if 'predicted_close' in lstm_df.columns:
-                df['predicted_close'] = lstm_df['predicted_close']
+            if macd_df is not None:
+                if 'macd' in macd_df.columns:
+                    df['macd'] = macd_df['macd']
+                if 'signal_line' in macd_df.columns:
+                    df['macd_signal'] = macd_df['signal_line']
+                if 'histogram' in macd_df.columns:
+                    df['macd_hist'] = macd_df['histogram']
+                if 'position' in macd_df.columns:
+                    df['macd_position'] = macd_df['position']
+            else:
+                logger.warning("MACD策略没有生成有效的信号DataFrame")
+                
+            if lstm_df is not None:
+                if 'position' in lstm_df.columns:
+                    df['lstm_position'] = lstm_df['position']
+                if 'predicted_close' in lstm_df.columns:
+                    df['predicted_close'] = lstm_df['predicted_close']
+            else:
+                logger.warning("LSTM策略没有生成有效的信号DataFrame")
             
             # 检查是否成功合并了信号
             if 'macd_position' not in df.columns:
-                logger.warning("无法合并MACD仓位信号")
+                logger.warning("无法合并MACD仓位信号，将使用0值")
                 df['macd_position'] = 0
             if 'lstm_position' not in df.columns:
-                logger.warning("无法合并LSTM仓位信号")
+                logger.warning("无法合并LSTM仓位信号，将使用0值")
                 df['lstm_position'] = 0
+                
+            # 确保所有数值列不包含NaN值
+            numeric_columns = df.select_dtypes(include=['number']).columns
+            for col in numeric_columns:
+                if df[col].isna().any():
+                    logger.warning(f"列 '{col}' 包含NaN值，将使用前向填充和后向填充")
+                    df[col] = df[col].fillna(method='ffill').fillna(method='bfill').fillna(0)
             
             # 根据组合方法生成最终信号
             logger.info(f"使用{self.ensemble_method}方法组合信号...")
@@ -534,6 +683,8 @@ class MACDLSTMHybridStrategy:
                 elif self.ensemble_method == 'layered':
                     signal = self._layered_ensemble(macd_signal, lstm_signal, i, df)
                 elif self.ensemble_method == 'expert':
+                    # 确保市场状态格式正确
+                    current_market_state = self._convert_old_market_state(current_market_state)
                     signal = self._expert_ensemble(macd_signal, lstm_signal, current_market_state)
                 else:
                     logger.warning(f"未知的组合方法: {self.ensemble_method}，使用投票法")
@@ -878,10 +1029,44 @@ class MACDLSTMHybridStrategy:
             try:
                 # 初始资金为1
                 initial_capital = 1.0
-                results_df['cumulative_strategy_returns'] = (1 + results_df['strategy_returns_after_commission']).cumprod()
+                
+                # 确保strategy_returns_after_commission中没有NaN值或极端值
+                returns = results_df['strategy_returns_after_commission'].copy()
+                
+                # 检查是否有NaN值
+                if returns.isna().any():
+                    logger.warning(f"策略收益率中存在{returns.isna().sum()}个NaN值，将使用0替代")
+                    returns = returns.fillna(0)
+                
+                # 检查是否有极端值
+                extreme_returns = returns[abs(returns) > 0.5]
+                if not extreme_returns.empty:
+                    logger.warning(f"策略收益率中存在{len(extreme_returns)}个极端值，最大值为{returns.max():.4f}，最小值为{returns.min():.4f}")
+                    # 将极端值限制在合理范围内
+                    returns = returns.clip(-0.5, 0.5)
+                
+                # 计算累积收益率 - 确保从1.0开始
+                results_df['cumulative_strategy_returns'] = (1 + returns).cumprod()
+                
+                # 验证累积收益率的有效性
+                cum_returns = results_df['cumulative_strategy_returns']
+                if cum_returns.isna().any() or cum_returns.min() <= 0:
+                    logger.warning("累积收益率包含无效值，进行修复")
+                    # 修复无效的累积收益率
+                    cum_returns = cum_returns.fillna(method='ffill').fillna(method='bfill').fillna(1.0)
+                    # 确保所有值都大于0
+                    cum_returns = cum_returns.clip(lower=0.01)
+                    results_df['cumulative_strategy_returns'] = cum_returns
                 
                 # 计算资金曲线，这是回测引擎必需的
                 results_df['equity_curve'] = initial_capital * results_df['cumulative_strategy_returns']
+                
+                # 验证资金曲线
+                if results_df['equity_curve'].isna().any() or results_df['equity_curve'].min() <= 0:
+                    logger.warning("资金曲线包含无效值，进行修复")
+                    equity_curve = results_df['equity_curve'].fillna(method='ffill').fillna(method='bfill').fillna(initial_capital)
+                    equity_curve = equity_curve.clip(lower=0.01)
+                    results_df['equity_curve'] = equity_curve
                 
                 # 添加 cumulative_returns 列以满足可视化器的需求
                 results_df['cumulative_returns'] = (1 + results_df['daily_returns']).cumprod()
@@ -899,8 +1084,20 @@ class MACDLSTMHybridStrategy:
                     results_df['cumulative_returns'] = results_df['cumulative_returns'].fillna(1.0)
                     final_capital = initial_capital
                 
-                logger.info(f"起始资金: {initial_capital:.2f}, 最终资金: {final_capital:.2f}")
+                # 记录起始和结束资金
+                logger.info(f"起始资金: {initial_capital:.4f}, 最终资金: {final_capital:.4f}")
                 logger.info(f"总收益率: {((final_capital/initial_capital)-1)*100:.2f}%")
+                
+                # 打印资金曲线的主要统计信息作为调试
+                equity_stats = {
+                    "min": results_df['equity_curve'].min(),
+                    "max": results_df['equity_curve'].max(),
+                    "mean": results_df['equity_curve'].mean(),
+                    "start": results_df['equity_curve'].iloc[0],
+                    "end": results_df['equity_curve'].iloc[-1]
+                }
+                logger.info(f"资金曲线统计: {equity_stats}")
+                
             except Exception as e:
                 logger.error(f"计算累积收益率时出错: {str(e)}")
                 results_df['cumulative_strategy_returns'] = 1.0
@@ -947,7 +1144,24 @@ class MACDLSTMHybridStrategy:
                 logger.info(f"  年化收益率: {performance_metrics['annual_return']:.2%}")
                 logger.info(f"  最大回撤: {performance_metrics['max_drawdown']:.2%}")
                 logger.info(f"  夏普比率: {performance_metrics['sharpe_ratio']:.2f}")
-                logger.info(f"  胜率: {performance_metrics['win_rate']:.2f}")
+                logger.info(f"  胜率: {performance_metrics['win_rate']:.2%}")
+                
+                # 添加风控评估
+                risk_assessment = "通过"
+                if abs(performance_metrics['max_drawdown']) > 0.15:
+                    risk_assessment = "不通过 - 最大回撤过大"
+                    logger.warning(f"策略风控评估不通过: 最大回撤({abs(performance_metrics['max_drawdown']):.2%})超过15%限制")
+                    
+                if performance_metrics['calmar_ratio'] < 2.5:
+                    risk_assessment = "不通过 - Calmar比率过低"
+                    logger.warning(f"策略风控评估不通过: Calmar比率({performance_metrics['calmar_ratio']:.2f})低于2.5标准")
+                
+                # 添加风控评估结果到性能指标中
+                performance_metrics['risk_assessment'] = risk_assessment
+                
+                # 如果不通过风控，考虑调整策略参数
+                if risk_assessment != "通过":
+                    logger.info("策略未通过风控检查，建议调整风险参数或使用更保守的集成方法")
             except Exception as e:
                 logger.error(f"记录性能指标时出错: {str(e)}")
                 performance_metrics = self._get_default_performance_metrics()
@@ -1039,6 +1253,12 @@ class MACDLSTMHybridStrategy:
                     calmar_ratio = 0
                 else:
                     calmar_ratio = annual_return / abs(max_drawdown)
+                    
+                # 风控规范检查
+                if abs(max_drawdown) > 0.15:  # 最大回撤超过15%
+                    logger.warning(f"策略最大回撤({abs(max_drawdown):.2%})超过风控标准(15%)")
+                if calmar_ratio < 2.5:  # Calmar比率低于2.5
+                    logger.warning(f"策略Calmar比率({calmar_ratio:.2f})低于风控标准(2.5)")
             except Exception as e:
                 logger.error(f"计算卡尔玛比率时出错: {str(e)}")
                 calmar_ratio = 0
@@ -1059,6 +1279,25 @@ class MACDLSTMHybridStrategy:
                 winning_trades = 0
                 losing_trades = 0
                 win_rate = 0
+            
+            # 交易次数计算
+            try:
+                # 使用position变化计算交易次数
+                if 'position' in df.columns:
+                    trade_count = (df['position'] != df['position'].shift(1)).sum()
+                    # 确保第一个值不被计为交易
+                    if len(df) > 0 and not pd.isna(df['position'].iloc[0]):
+                        trade_count -= 1
+                    
+                    # 确保得到的值合理
+                    if pd.isna(trade_count) or trade_count < 0:
+                        trade_count = 0
+                else:
+                    logger.warning("计算交易次数失败：缺少position列")
+                    trade_count = total_trades  # 使用胜率计算中的交易总数作为替代
+            except Exception as e:
+                logger.error(f"计算交易次数时出错: {str(e)}")
+                trade_count = 0
             
             # 盈亏比
             try:
@@ -1107,7 +1346,8 @@ class MACDLSTMHybridStrategy:
                 "win_rate": win_rate,
                 "profit_loss_ratio": profit_loss_ratio,
                 "winning_trades": winning_trades,
-                "losing_trades": losing_trades
+                "losing_trades": losing_trades,
+                "trade_count": trade_count
             }
         except Exception as e:
             logger.error(f"计算性能指标时发生未处理的异常: {str(e)}")
@@ -1131,5 +1371,6 @@ class MACDLSTMHybridStrategy:
             "win_rate": 0.0,
             "profit_loss_ratio": 0.0,
             "winning_trades": 0,
-            "losing_trades": 0
+            "losing_trades": 0,
+            "trade_count": 0
         } 

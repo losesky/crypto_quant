@@ -239,6 +239,11 @@ class EnhancedLSTMPricePredictor:
                     logger.warning(f"分类特征 '{col}' 有太多唯一值 ({df_processed[col].nunique()})，将被移除")
                     df_processed = df_processed.drop(col, axis=1)
             
+            # 显式检查并删除close_time列，避免警告
+            if 'close_time' in df_processed.columns:
+                logger.info("删除不需要的close_time列")
+                df_processed = df_processed.drop('close_time', axis=1)
+            
             # 价格特征
             df_processed['log_return'] = np.log(df_processed['close'] / df_processed['close'].shift(1))
             df_processed['price_range'] = (df_processed['high'] - df_processed['low']) / df_processed['close']
